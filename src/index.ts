@@ -15,6 +15,7 @@ import { ImageMessageSchema } from './schemas/imageMessage';
 import { PullConsumerMessageSchema } from './schemas/pullConsumerMessage';
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { env } from 'hono/adapter';
+import { NonRetryableError } from 'cloudflare:workflows';
 
 export interface Env {
   WORKFLOW_KV_STORE: any;
@@ -66,11 +67,6 @@ type Params = { queryParameters: z.infer<typeof QueryParametersSchema>, url: str
 export class ImageGenWorkflow extends WorkflowEntrypoint<Env, Params> {
   // Define a run() method
   async run(event: Readonly<WorkflowEvent<Params>>, step: WorkflowStep) {
-    // Define one or more steps that optionally return state.
-    // let state = step.do("my first step", async () => {
-    //   await event.payload.env.IMAGE_GENERATION_WORKFLOWS.put(event.payload.imageKey, event.instanceId);
-    // });
-
     const { userId, imageKey } = await step.do("Preprocessing", async (): Promise<{ userId: string; imageKey: string }> => {
       return { userId, imageKey: `${userId}:${event.payload.url.split('?')[1]}`};
     });
@@ -80,28 +76,23 @@ export class ImageGenWorkflow extends WorkflowEntrypoint<Env, Params> {
       const stub = this.env.WORKFLOW_KV_STORE.get(id);
 
       if (await stub.get(imageKey)) {
-        const error = "Image already exists.";
-        console.error('An error occurred:', error);
-        throw error;
+        throw new NonRetryableError("Image already exists");
       }
 
       await stub.put(imageKey, event.instanceId);
     });
 
     const { imageMessage, vector } = await step.do("createVector", async () => {
-      console.log("Create vector");
-
       const { configuration, fontFamily, fontVariant, layout, layoutIndex } = event.payload.queryParameters;
       const parsedQueryParamaters = LayoutSchema.parse({
         discriminator: `${layout}${layoutIndex.toString()}`,
         data: event.payload.queryParameters,
       });
 
-
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const markup = createMarkup(parsedQueryParamaters);
       const vector = await markupToVector(configuration, fontFamily, fontVariant, env.GOOGLE_FONTS, markup);
-      const imageMessage: z.infer<typeof ImageMessageSchema> = { userData: { userId: "wkenned1" }, imageMetadata: parsedQueryParamaters, imageKey: imageKey };
+      const imageMessage: z.infer<typeof ImageMessageSchema> = { userData: { userId: userId }, imageMetadata: parsedQueryParamaters, imageKey: imageKey };
 
       return { imageMessage, vector };
     });
@@ -112,19 +103,10 @@ export class ImageGenWorkflow extends WorkflowEntrypoint<Env, Params> {
       }
 
       await this.env.SVG_BUCKET.put(imageMessage.imageKey, vector);
-
-      console.log("Cached svg");
     });
 
     const png = await step.do("createPng", async () => {
-      console.log("Create png");
-      if (!env.SVG_BUCKET) {
-        console.error("PNG_BUCKET is not defined in the environment");
-      }
-
       const encoder = new TextEncoder();
-
-      // const image = await event.payload.env.SVG_BUCKET.get(imageMessage.imageKey);
 
       const response = await fetch("https://snapgen.media/png/", {
         method: "POST",
@@ -138,13 +120,7 @@ export class ImageGenWorkflow extends WorkflowEntrypoint<Env, Params> {
         body: encoder.encode(vector),
       });
 
-      if (!env.PNG_BUCKET) {
-        console.error("PNG_BUCKET is not defined in the environment");
-      }
-
-      const pngBody = await response.arrayBuffer();
-
-      return pngBody;
+      return await response.arrayBuffer();
     });
 
     await step.do("Cache png", async () => {
@@ -155,13 +131,10 @@ export class ImageGenWorkflow extends WorkflowEntrypoint<Env, Params> {
       await this.env.PNG_BUCKET.put(imageMessage.imageKey, png, {
         httpMetadata: { contentType: "image/png" },
       });
-
-      console.log("Cached png");
     });
 
     await step.do("Publish png", async () => {
       await env.PNG_QUEUE_PUBLISH.send(imageMessage);
-      console.log("Published png");
     });
 
   }
@@ -195,49 +168,15 @@ app.get('/', zValidator('query', QueryParametersSchema), async (c) => {
 app.post('/', zValidator('query', QueryParametersSchema), async (c) => {
   const queryParameters = c.req.valid('query');
 
-  console.log("working1")
-
   if (!c.env.IMAGE_GENERATION_WORKFLOWS) {
     console.error("IMAGE_GENERATION_WORKFLOWS is not defined in the environment");
   }
-  console.log("working2")
 
   const params: Params = { queryParameters: queryParameters, url: c.req.url.toString()};
 
-  console.log(params);
-
   const instance = await c.env.IMAGE_GEN_WORKFLOW.create({params});
 
-  return c.text('OK');
-
-  const userId = "wkenend1";
-  const { configuration, fontFamily, fontVariant, layout, layoutIndex } = queryParameters;
-  const parsedQueryParamaters = LayoutSchema.parse({
-    discriminator: `${layout}${layoutIndex.toString()}`,
-    data: queryParameters,
-  });
-
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const markup = createMarkup(parsedQueryParamaters);
-
-  const vector = await markupToVector(configuration, fontFamily, fontVariant, c.env.GOOGLE_FONTS, markup);
-
-  const imageKey = `${userId}:${c.req.url.split('?')[1]}`;
-
-  if (!c.env.SVG_BUCKET) {
-    console.error("SVG_BUCKET is not defined in the environment");
-  }
-
-  await c.env.SVG_BUCKET.put(imageKey, vector);
-
-  const imageMessage: z.infer<typeof ImageMessageSchema> = { userData: { userId: "wkenned1" }, imageMetadata: parsedQueryParamaters, imageKey: imageKey };
-
-  await c.env.IMAGE_QUEUE_PUBLISH.send(imageMessage);
-
-  return c.body(vector, 200, {
-    'Content-Type': 'image/svg+xml',
-    'Access-Control-Allow-Origin': '*',
-  });
+  return c.json({ instanceId: instance.id }, 200);
 });
 
 app.get('/image', async (c) => {
@@ -292,40 +231,9 @@ app.onError((error, c) => {
 export default {
   fetch: app.fetch,
   async queue(batch: MessageBatch<any>, env: Environment) {
-    console.log(`MESSAGE: ${JSON.stringify(batch.messages[0].body)}`);
-    const body = ImageMessageSchema.parse(batch.messages[0].body);
-
-    if (!env.SVG_BUCKET) {
-      console.error("PNG_BUCKET is not defined in the environment");
-    }
-
-    const image = await env.SVG_BUCKET.get(body.imageKey);
-
-    const response = await fetch("https://snapgen.media/png/", {
-      method: "POST",
-      headers: {
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-        "Content-Type": "image/svg+xml",
-        "CF-Worker": "true",
-        "User-Agent": "SnapGen/1.0 (Cloudflare Worker; +https://staticpress.host)"
-      },
-      body: await streamToUint8Array(image.body),
-    });
-
-    if (!env.PNG_BUCKET) {
-      console.error("PNG_BUCKET is not defined in the environment");
-    }
-
-    const pngBody = await response.arrayBuffer();
-
-    await env.PNG_BUCKET.put(body.imageKey, pngBody, {
-      httpMetadata: { contentType: "image/png" },
-    });
-
-    await env.PNG_QUEUE_PUBLISH.send(body);
   },
 }
+
 
 /*
 
