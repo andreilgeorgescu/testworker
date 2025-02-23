@@ -66,6 +66,10 @@ type Params = { queryParameters: z.infer<typeof QueryParametersSchema>, url: str
 // Create your own class that implements a Workflow
 export class ImageGenWorkflow extends WorkflowEntrypoint<Env, Params> {
   // Define a run() method
+  test() {
+    console.log("TEST");
+  }
+
   async run(event: Readonly<WorkflowEvent<Params>>, step: WorkflowStep) {
     const { userId, imageKey } = await step.do("Preprocessing", async (): Promise<{ userId: string; imageKey: string }> => {
       return { userId, imageKey: `${userId}:${event.payload.url.split('?')[1]}`};
@@ -214,6 +218,25 @@ app.get('/image', async (c) => {
     'Content-Type': 'image/png',
     'Access-Control-Allow-Origin': '*',
   });
+});
+
+// Working topic url: https://www.youtube.com/xml/feeds/videos.xml?channel_id=UCdm6PGHVDK2A0OWk4Fz91DA
+
+app.post('/youtube/notifications/upload', async (c) => {
+  // Get the raw XML from the request body
+  const xmlPayload = await c.req.text();
+
+  // Log or process the XML payload.
+  // Optionally, you can use an XML parser like 'fast-xml-parser' or 'xml2js'
+  console.log('Received Atom Notification:', xmlPayload);
+
+  // Return a response to acknowledge receipt
+  return c.text('Notification received');
+});
+
+app.get('/youtube/notifications/upload', async (c) => {
+  const queryParameters = c.req.query('hub.challenge');
+  return c.text(queryParameters || "");
 });
 
 app.onError((error, c) => {
